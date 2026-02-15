@@ -1,0 +1,67 @@
+version: "3.9"
+
+services:
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+    ports:
+      - "2181:2181"
+
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://kafka:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server=localhost:9092"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+
+  producer_order:
+    build:
+      context: ..
+      dockerfile: stream-kafka/producer_order/Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      KAFKA_BOOTSTRAP: kafka:29092
+      DB_PATH: /data/shared.db
+    volumes:
+      - ../common/db/shared.db:/data/shared.db
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+  inventory_consumer:
+    build:
+      context: ..
+      dockerfile: stream-kafka/inventory_consumer/Dockerfile
+    environment:
+      KAFKA_BOOTSTRAP: kafka:29092
+      DB_PATH: /data/shared.db
+    volumes:
+      - ../common/db/shared.db:/data/shared.db
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+  analytics_consumer:
+    build:
+      context: ..
+      dockerfile: stream-kafka/analytics_consumer/Dockerfile
+    environment:
+      KAFKA_BOOTSTRAP: kafka:29092
+    depends_on:
+      kafka:
+        condition: service_healthy
