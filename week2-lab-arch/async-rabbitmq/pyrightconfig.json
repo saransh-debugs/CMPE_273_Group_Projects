@@ -1,0 +1,4 @@
+{
+  "extraPaths": ["broker"],
+  "include": ["tests", "broker", "order_service", "inventory_service", "notification_service"]
+}
