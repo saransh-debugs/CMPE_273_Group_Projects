@@ -1,0 +1,87 @@
+version: "3.9"
+
+services:
+  rabbitmq:
+    image: rabbitmq:3-management
+    hostname: rabbitmq
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    networks:
+      - order_net
+  broker-setup:
+    build:
+      context: ..
+      dockerfile: async-rabbitmq/broker/Dockerfile
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    environment:
+      RABBITMQ_HOST: rabbitmq
+    networks:
+      - order_net
+
+  order-service:
+    build:
+      context: ..
+      dockerfile: async-rabbitmq/order_service/Dockerfile
+    depends_on:
+      broker-setup:
+        condition: service_completed_successfully
+    environment:
+      RABBITMQ_HOST: rabbitmq
+      DB_PATH: /data/shared.db
+    ports:
+      - "9001:9001"
+    volumes:
+      - ../common/db/shared.db:/data/shared.db
+    stdin_open: true
+    networks:
+      - order_net
+  inventory-service:
+    build:
+      context: ..
+      dockerfile: async-rabbitmq/inventory_service/Dockerfile
+    depends_on:
+      broker-setup:
+        condition: service_completed_successfully
+    environment:
+      RABBITMQ_HOST: rabbitmq
+      DB_PATH: /data/shared.db
+    volumes:
+      - ../common/db/shared.db:/data/shared.db
+    networks:
+      - order_net
+  notification-service:
+    build:
+      context: ..
+      dockerfile: async-rabbitmq/notification_service/Dockerfile
+    depends_on:
+      broker-setup:
+        condition: service_completed_successfully
+    environment:
+      RABBITMQ_HOST: rabbitmq
+      DB_PATH: /data/shared.db
+    volumes:
+      - notification_logs:/app/logs
+      - ../common/db/shared.db:/data/shared.db
+    networks:
+      - order_net
+
+volumes:
+  rabbitmq_data:
+  notification_logs:
+
+networks:
+  order_net:
+    driver: bridge
