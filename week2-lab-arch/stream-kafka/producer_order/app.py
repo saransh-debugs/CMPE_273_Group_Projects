@@ -69,6 +69,7 @@ def create_order(order: OrderRequest) -> OrderResponse:
 
     # Publish to Kafka
     event = {
+        "type": "OrderPlaced",
         "order_id": order_id,
         "item_id": order.item_id,
         "qty": order.qty,

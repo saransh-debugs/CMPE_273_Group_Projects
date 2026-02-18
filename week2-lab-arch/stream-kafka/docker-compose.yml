@@ -13,35 +13,55 @@ services:
     depends_on:
       - zookeeper
     ports:
-      - "9092:9092"
+      - "29092:29092"
     environment:
       KAFKA_BROKER_ID: 1
       KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://kafka:9092
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:29092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT
       KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
-      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
     healthcheck:
-      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server=localhost:9092"]
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server=kafka:29092"]
       interval: 10s
       timeout: 10s
-      retries: 5
+      retries: 10
+
+
+
+  # Create topics explicitly (orders, inventory-events)
+  topic-init:
+    image: confluentinc/cp-kafka:7.5.0
+    depends_on:
+      kafka:
+        condition: service_healthy
+    command: >
+      bash -lc "
+      echo 'Creating topics...';
+      kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic orders --partitions 3 --replication-factor 1;
+      kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic inventory-events --partitions 3 --replication-factor 1;
+      echo 'Topics:';
+      kafka-topics --bootstrap-server kafka:29092 --list;
+      "
 
   producer_order:
     build:
       context: ..
       dockerfile: stream-kafka/producer_order/Dockerfile
     ports:
-      - "8000:8000"
+      - "8000:8000"  # your FastAPI /order endpoint
     environment:
       KAFKA_BOOTSTRAP: kafka:29092
+      ORDERS_TOPIC: orders
       DB_PATH: /data/shared.db
     volumes:
-      - ../common/db/shared.db:/data/shared.db
+      - producer_data:/data
     depends_on:
-      kafka:
-        condition: service_healthy
+      topic-init:
+        condition: service_completed_successfully
 
   inventory_consumer:
     build:
@@ -49,12 +69,16 @@ services:
       dockerfile: stream-kafka/inventory_consumer/Dockerfile
     environment:
       KAFKA_BOOTSTRAP: kafka:29092
+      GROUP_ID: inventory-group         # inventory_consumer
+      ORDERS_TOPIC: orders
+      INVENTORY_EVENTS_TOPIC: inventory-events
+      THROTTLE_MS: "20"  # optional, to slow down processing for testing
       DB_PATH: /data/shared.db
     volumes:
-      - ../common/db/shared.db:/data/shared.db
+      - inventory_data:/data
     depends_on:
-      kafka:
-        condition: service_healthy
+      topic-init:
+        condition: service_completed_successfully
 
   analytics_consumer:
     build:
@@ -62,6 +86,20 @@ services:
       dockerfile: stream-kafka/analytics_consumer/Dockerfile
     environment:
       KAFKA_BOOTSTRAP: kafka:29092
+      GROUP_ID: analytics-group         # analytics_consumer
+      ORDERS_TOPIC: orders
+      INVENTORY_EVENTS_TOPIC: inventory-events
+      # THROTTLE_MS: "10"  
+      # optional if your analytics code uses them
+      EXPECTED_ORDERS: "10000"
+      REPORT_PATH: /reports/metrics_report.txt
+    volumes:
+      - analytics_reports:/reports
     depends_on:
-      kafka:
-        condition: service_healthy
+      topic-init:
+        condition: service_completed_successfully
+
+volumes:
+  producer_data:
+  inventory_data:
+  analytics_reports:
