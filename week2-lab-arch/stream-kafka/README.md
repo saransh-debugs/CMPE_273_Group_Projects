@@ -62,25 +62,62 @@ Wait for all services to be healthy (Kafka, Zookeeper, producers, consumers).
 
 ### Test Scenarios
 
-Install test dependencies:
-```bash
-pip install -r tests/requirements.txt
-```
+#### Producer publishes OrderEvents stream: OrderPlaced
+![alt text](<test_screenshots/Screenshot 2026-02-18 at 12.39.22 AM.png>) 
+![alt text](<test_screenshots/Screenshot 2026-02-18 at 12.39.32 AM.png>) 
 
-**Baseline Latency (50 orders):**
-```bash
-python tests/run_tests.py --baseline 50
-```
+#### Inventory consumes and emits InventoryEvents
+![alt text](<test_screenshots/Screenshot 2026-02-18 at 12.39.41 AM.png>) 
 
-**Load Test (1000 rapid orders):**
-```bash
-python tests/run_tests.py --load 1000
-```
+#### Analytics consumes streams and computes
+  1. Placed two orders
+![alt text](<test_screenshots/Screenshot 2026-02-18 at 12.39.53 AM.png>) 
 
-**Consumer Lag (100 orders):**
-```bash
-python tests/run_tests.py --lag 100
-```
+  2. docker logs -f stream-kafka-analytics_consumer-1
+
+![alt text](<test_screenshots/Screenshot 2026-02-18 at 12.40.06 AM.png>) 
+
+#### Demonstrate replay 
+  1. Place order for 50
+![alt text](<test_screenshots/Screenshot 2026-02-18 at 12.40.18 AM.png>)
+
+  2. Before reset Inventory-order logs/metrics
+![alt text](<test_screenshots/Screenshot 2026-02-18 at 12.40.25 AM.png>)
+
+  3. Reset Inventory-order logs/metrics
+![alt text](<test_screenshots/Screenshot 2026-02-18 at 12.40.34 AM.png>)
+
+  4. After Reset - Reset analytics offsets back to earliest 
+![alt text](<test_screenshots/Screenshot 2026-02-18 at 12.40.44 AM.png>)
+
+
+ #### Testing requirements
+  1. Produce 10k events
+![alt text](<test_screenshots/Screenshot 2026-02-18 at 12.42.19 AM.png>)
+
+![alt text](<test_screenshots/Screenshot 2026-02-18 at 12.42.46 AM.png>)
+
+    a.  Metrics for the same  
+![alt text](<test_screenshots/Screenshot 2026-02-18 at 12.42.57 AM.png>)
+
+    b. Total orders is ~ 10,000 events. Here, you see events > 10k because there were few orders already. 
+![alt text](<test_screenshots/Screenshot 2026-02-18 at 12.43.10 AM.png>)
+
+  2. Show consumer lag under throttling = 20
+![alt text](<test_screenshots/Screenshot 2026-02-18 at 12.43.29 AM.png>)
+  
+![alt text](<test_screenshots/Screenshot 2026-02-18 at 12.43.39 AM.png>)
+
+  3. Show replay producing consistent metrics (or explain why not)
+    a. Before replay - Analytics consumer is inactive
+![alt text](<test_screenshots/Screenshot 2026-02-18 at 12.43.49 AM.png>)
+
+    b. Reset offsets
+![alt text](<test_screenshots/Screenshot 2026-02-18 at 12.44.05 AM.png>)
+
+    c. After Reset
+![alt text](<test_screenshots/Screenshot 2026-02-18 at 12.44.16 AM.png>) 
+
 
 ## Key Features
 

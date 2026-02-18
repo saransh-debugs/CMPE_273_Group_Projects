@@ -1,264 +1,236 @@
+import os
 import json
 import time
 import logging
-from confluent_kafka import Consumer, Producer
-from confluent_kafka.error import KafkaError
+from confluent_kafka import Consumer, Producer, KafkaError
 
 from common import db as common_db
-from models import OrderPlacedEvent, InventoryEvent
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("inventory_consumer")
 
 
 class InventoryConsumer:
-    def __init__(self, bootstrap_servers: str = "localhost:9092", group_id: str = "inventory-group"):
+    def __init__(self, bootstrap_servers: str, group_id: str = "inventory-group"):
         self.bootstrap_servers = bootstrap_servers
         self.group_id = group_id
-        
-        # Consumer config
+
+        self.orders_topic = os.getenv("ORDERS_TOPIC", "orders")
+        self.inventory_events_topic = os.getenv("INVENTORY_EVENTS_TOPIC", "inventory-events")
+        self.throttle_ms = int(os.getenv("THROTTLE_MS", "0"))
+
+        logger.info(f"InventoryConsumer init: bootstrap={self.bootstrap_servers} group_id={self.group_id} "
+                    f"orders_topic={self.orders_topic} inventory_topic={self.inventory_events_topic} throttle_ms={self.throttle_ms}")
+
+        # Consumer (manual commit)
         self.consumer = Consumer({
-            "bootstrap.servers": bootstrap_servers,
-            "group.id": group_id,
+            "bootstrap.servers": self.bootstrap_servers,
+            "group.id": self.group_id,
             "auto.offset.reset": "earliest",
             "enable.auto.commit": False,
         })
-        
+
         # Producer for inventory events
         self.producer = Producer({
-            "bootstrap.servers": bootstrap_servers,
+            "bootstrap.servers": self.bootstrap_servers,
             "acks": "all",
+            "retries": 3,
         })
-        
-        # Track processed orders for idempotency
-        self.processed_orders = set()
 
     def start(self):
-        """Subscribe to orders topic and begin consuming."""
-        max_retries = 10
+        """Subscribe to orders topic."""
+        max_retries = 6
         for attempt in range(max_retries):
             try:
-                self.consumer.subscribe(["orders"])
-                logger.info("Subscribed to 'orders' topic")
+                self.consumer.subscribe([self.orders_topic])
+                logger.info(f"Subscribed to '{self.orders_topic}'")
                 return
             except Exception as e:
-                logger.warning(f"Attempt {attempt+1}/{max_retries} to subscribe failed: {e}")
-                if attempt < max_retries - 1:
-                    time.sleep(5)
-        raise Exception("Failed to subscribe after max retries")
+                logger.warning(f"Subscribe attempt {attempt+1}/{max_retries} failed: {e}")
+                time.sleep(2)
+        raise RuntimeError("Failed to subscribe to topic")
 
-    def process_message(self, message: dict) -> bool:
-        """
-        Process an order and emit inventory event.
-        
-        Idempotency: Skip if order_id already processed.
-        """
-        order_id = message.get("order_id")
-        
-        # Idempotency check
-        if order_id in self.processed_orders:
-            logger.info(f"Order {order_id} already processed, skipping")
-            return True
-        
-        item_id = message.get("item_id")
-        qty = message.get("qty")
-        timestamp = time.time()
-        
-        # Check inventory
-        conn = common_db.connect()
+    def _already_processed(self, conn, order_id: str) -> bool:
+        r = conn.execute("SELECT 1 FROM reservations WHERE order_id = ? LIMIT 1", (order_id,)).fetchone()
+        return r is not None
+
+    def _publish_inventory_event(self, event: dict) -> bool:
         try:
-            row = conn.execute(
-                "SELECT quantity FROM inventory WHERE item_id = ?",
-                (item_id,),
-            ).fetchone()
-            
-            if not row:
-                status = "failed"
-                detail = "Item not found"
-            elif row[0] < qty:
-                status = "failed"
-                detail = f"Insufficient stock: {row[0]} available, {qty} requested"
-            else:
-                # Reserve inventory
-                conn.execute(
-                    "UPDATE inventory SET quantity = quantity - ? WHERE item_id = ?",
-                    (qty, item_id),
-                )
-                conn.execute(
-                    "INSERT OR REPLACE INTO reservations (order_id, item_id, qty, reserved_at) VALUES (?, ?, ?, ?)",
-                    (order_id, item_id, qty, time.time()),
-                )
-                conn.commit()
-                status = "reserved"
-                detail = "Inventory reserved"
-        except Exception as e:
-            logger.error(f"DB error processing order {order_id}: {e}")
-            status = "failed"
-            detail = str(e)
-        finally:
-            conn.close()
-        
-        # Publish inventory event
-        event = {
-            "order_id": order_id,
-            "item_id": item_id,
-            "status": status,
-            "qty": qty,
-            "timestamp": timestamp,
-        }
-        
-        try:
-            self.producer.produce(
-                topic="inventory-events",
-                key=order_id.encode("utf-8"),
-                value=json.dumps(event).encode("utf-8"),
-            )
+            key = str(event.get("order_id", "unknown")).encode("utf-8")
+            value = json.dumps(event).encode("utf-8")
+            self.producer.produce(topic=self.inventory_events_topic, key=key, value=value)
             self.producer.flush(timeout=5)
-            logger.info(f"Published inventory event: {order_id} -> {status}")
+            logger.info(f"Published inventory event: {event.get('order_id')} -> {event.get('type')}")
+            return True
         except Exception as e:
             logger.error(f"Failed to publish inventory event: {e}")
             return False
-        
-        # Mark as processed
-        self.processed_orders.add(order_id)
-        return True
-
-    def run(self):
-        """Main consumer loop."""
-        try:
-            while True:
-                msg = self.consumer.poll(timeout=1.0)
-                
-                if msg is None:
-                    continue
-                
-                if msg.error():
-                    if msg.error().code() == KafkaError._PARTITION_EOF:
-                        continue
-                    else:
-                        logger.error(f"Consumer error: {msg.error()}")
-                        continue
-                
-                try:
-                    payload = json.loads(msg.value().decode("utf-8"))
-                    logger.info(f"Received order: {payload}")
-                    self.process_message(payload)
-                    self.consumer.commit(asynchronous=False)
-                except json.JSONDecodeError as e:
-                    logger.error(f"JSON decode error: {e}")
-                    self.consumer.commit(asynchronous=False)
-                except Exception as e:
-                    logger.error(f"Error processing message: {e}")
-        except KeyboardInterrupt:
-            logger.info("Consumer interrupted")
-        finally:
-            self.consumer.close()
-            self.producer.flush()
 
     def process_message(self, message: dict) -> bool:
         """
-        Process an order and emit inventory event.
-        
-        Idempotency: Skip if order_id already processed.
+        Durable idempotency: check reservations table for order_id.
+        Commit consumer offset only after _publish_inventory_event returns True.
         """
         order_id = message.get("order_id")
-        
-        # Idempotency check
-        if order_id in self.processed_orders:
-            logger.info(f"Order {order_id} already processed, skipping")
-            return True
-        
         item_id = message.get("item_id")
         qty = message.get("qty")
-        timestamp = time.time()
-        
-        # Check inventory
+
+        if self.throttle_ms > 0:
+            time.sleep(self.throttle_ms / 1000.0)
+
+        if not order_id or not item_id or qty is None:
+            logger.error("Malformed order message: %s", message)
+            ev = {
+                "type": "InventoryFailed",
+                "order_id": order_id or "unknown",
+                "item_id": item_id or "unknown",
+                "qty": qty if qty is not None else -1,
+                "status": "failed",
+                "timestamp": time.time(),
+                "reason": "malformed_order",
+            }
+            return self._publish_inventory_event(ev)
+
+        qty = int(qty)
+        ts = float(message.get("timestamp", time.time()))
+        user_id = message.get("user_id", "unknown")
+
         conn = common_db.connect()
         try:
-            row = conn.execute(
-                "SELECT quantity FROM inventory WHERE item_id = ?",
-                (item_id,),
-            ).fetchone()
-            
+            conn.execute("BEGIN")
+            if self._already_processed(conn, order_id):
+                # Emit a reserved event (idempotent) and do not change stock
+                ev = {
+                    "type": "InventoryReserved",
+                    "order_id": order_id,
+                    "item_id": item_id,
+                    "qty": qty,
+                    "status": "reserved",
+                    "timestamp": ts,
+                    "note": "duplicate_order_id",
+                }
+                conn.commit()
+                return self._publish_inventory_event(ev)
+
+            row = conn.execute("SELECT quantity FROM inventory WHERE item_id = ?", (item_id,)).fetchone()
             if not row:
-                status = "failed"
-                detail = "Item not found"
-            elif row[0] < qty:
-                status = "failed"
-                detail = f"Insufficient stock: {row[0]} available, {qty} requested"
-            else:
-                # Reserve inventory
+                # record reservation as failed for idempotency
                 conn.execute(
-                    "UPDATE inventory SET quantity = quantity - ? WHERE item_id = ?",
-                    (qty, item_id),
-                )
-                conn.execute(
-                    "INSERT OR REPLACE INTO reservations (order_id, item_id, qty, reserved_at) VALUES (?, ?, ?, ?)",
-                    (order_id, item_id, qty, time.time()),
+                    "INSERT OR REPLACE INTO reservations(order_id, item_id, qty, reserved_at, status) VALUES (?, ?, ?, ?, ?)",
+                    (order_id, item_id, qty, time.time(), "failed"),
                 )
                 conn.commit()
-                status = "reserved"
-                detail = "Inventory reserved"
+                ev = {
+                    "type": "InventoryFailed",
+                    "order_id": order_id,
+                    "item_id": item_id,
+                    "qty": qty,
+                    "status": "failed",
+                    "timestamp": ts,
+                    "reason": "item_not_found",
+                }
+                return self._publish_inventory_event(ev)
+
+            available = int(row[0])
+            if available < qty:
+                conn.execute(
+                    "INSERT OR REPLACE INTO reservations(order_id, item_id, qty, reserved_at, status) VALUES (?, ?, ?, ?, ?)",
+                    (order_id, item_id, qty, time.time(), "failed"),
+                )
+                conn.commit()
+                ev = {
+                    "type": "InventoryFailed",
+                    "order_id": order_id,
+                    "item_id": item_id,
+                    "qty": qty,
+                    "status": "failed",
+                    "timestamp": ts,
+                    "reason": f"out_of_stock:{available}",
+                }
+                return self._publish_inventory_event(ev)
+
+            # reserve: decrement stock + record reservation
+            conn.execute("UPDATE inventory SET quantity = quantity - ? WHERE item_id = ?", (qty, item_id))
+            conn.execute(
+                "INSERT OR REPLACE INTO reservations(order_id, item_id, qty, reserved_at, status) VALUES (?, ?, ?, ?, ?)",
+                (order_id, item_id, qty, time.time(), "reserved"),
+            )
+            conn.commit()
+
+            ev = {
+                "type": "InventoryReserved",
+                "order_id": order_id,
+                "item_id": item_id,
+                "qty": qty,
+                "status": "reserved",
+                "timestamp": ts,
+            }
+            return self._publish_inventory_event(ev)
+
         except Exception as e:
-            logger.error(f"DB error processing order {order_id}: {e}")
-            status = "failed"
-            detail = str(e)
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            logger.exception("DB error processing order %s: %s", order_id, e)
+            ev = {
+                "type": "InventoryFailed",
+                "order_id": order_id,
+                "item_id": item_id,
+                "qty": qty,
+                "status": "failed",
+                "timestamp": ts,
+                "reason": f"db_error:{e}",
+            }
+            return self._publish_inventory_event(ev)
         finally:
             conn.close()
-        
-        # Publish inventory event
-        event = {
-            "order_id": order_id,
-            "item_id": item_id,
-            "status": status,
-            "qty": qty,
-            "timestamp": timestamp,
-        }
-        
-        try:
-            self.producer.produce(
-                topic="inventory-events",
-                key=order_id.encode("utf-8"),
-                value=json.dumps(event).encode("utf-8"),
-            )
-            self.producer.flush(timeout=5)
-            logger.info(f"Published inventory event: {order_id} -> {status}")
-        except Exception as e:
-            logger.error(f"Failed to publish inventory event: {e}")
-            return False
-        
-        # Mark as processed
-        self.processed_orders.add(order_id)
-        return True
 
     def run(self):
-        """Main consumer loop."""
+        """Main loop. commit offsets only after successful publish"""
+        self.start()
         try:
             while True:
                 msg = self.consumer.poll(timeout=1.0)
-                
                 if msg is None:
                     continue
-                
                 if msg.error():
                     if msg.error().code() == KafkaError._PARTITION_EOF:
                         continue
-                    else:
-                        logger.error(f"Consumer error: {msg.error()}")
-                        continue
-                
+                    logger.error("Consumer error: %s", msg.error())
+                    continue
+
                 try:
                     payload = json.loads(msg.value().decode("utf-8"))
-                    logger.info(f"Received order: {payload}")
-                    self.process_message(payload)
-                    self.consumer.commit(asynchronous=False)
+                    logger.info("Received order: %s", payload)
+                    ok = self.process_message(payload)
+
+                    if ok:
+                        # commit offset only after successful publish
+                        self.consumer.commit(message=msg, asynchronous=False)
+                    else:
+                        logger.warning("Publish failed; not committing offset so message will be retried")
+
                 except json.JSONDecodeError as e:
-                    logger.error(f"JSON decode error: {e}")
-                    self.consumer.commit(asynchronous=False)
+                    logger.error("JSON decode error: %s", e)
+                    # commit to skip bad message (or change behavior to send to DLQ)
+                    self.consumer.commit(message=msg, asynchronous=False)
                 except Exception as e:
-                    logger.error(f"Error processing message: {e}")
+                    logger.exception("Unexpected processing error: %s", e)
+                    # do not commit so message will be retried
         except KeyboardInterrupt:
-            logger.info("Consumer interrupted")
+            logger.info("Interrupted")
         finally:
-            self.consumer.close()
-            self.producer.flush()
+            try:
+                self.consumer.close()
+            finally:
+                self.producer.flush()
+
+
+if __name__ == "__main__":
+    # Read bootstrap from env (default to kafka:29092 inside compose)
+    bootstrap = os.getenv("KAFKA_BOOTSTRAP", "kafka:29092")
+    group = os.getenv("GROUP_ID", "inventory-group")
+    # Optional: show env for debugging
+    logger.info(f"Starting InventoryConsumer with BOOTSTRAP={bootstrap} GROUP_ID={group}")
+    InventoryConsumer(bootstrap_servers=bootstrap, group_id=group).run()
